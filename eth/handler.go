@@ -25,12 +25,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+        "strconv"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
-	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
+        "github.com/ethereum/go-ethereum/core/nodeprotocol"
+	"github.com/ethereum/go-ethereum/core/nodeprotocolmessaging"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/fetcher"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -55,7 +57,7 @@ const (
 )
 
 var (
-	daoChallengeTimeout = 15 * time.Second // Time allowance for a node to reply to the DAO handshake challenge
+	syncChallengeTimeout = 15 * time.Second // Time allowance for a node to reply to the sync progress challenge
 )
 
 // errIncompatibleConfig is returned if the requested protocols and configs are
@@ -71,6 +73,9 @@ type ProtocolManager struct {
 
 	fastSync  uint32 // Flag whether fast sync is enabled (gets disabled if we already have blocks)
 	acceptTxs uint32 // Flag whether we're considered synchronised (enables transaction processing)
+
+	checkpointNumber uint64      // Block number for the sync progress validator to cross reference
+	checkpointHash   common.Hash // Block hash for the sync progress validator to cross reference
 
 	txpool      txPool
 	blockchain  *core.BlockChain
@@ -88,6 +93,8 @@ type ProtocolManager struct {
 	txsSub        event.Subscription
 	minedBlockSub *event.TypeMuxSubscription
 
+	whitelist map[uint64]common.Hash
+
 	// channels for fetcher, syncer, txsyncLoop
 	newPeerCh   chan *peer
 	txsyncCh    chan *txsync
@@ -101,7 +108,7 @@ type ProtocolManager struct {
 
 // NewProtocolManager returns a new Ethereum sub protocol manager. The Ethereum sub protocol manages peers capable
 // with the Ethereum network.
-func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, networkID uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database) (*ProtocolManager, error) {
+func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, networkID uint64, mux *event.TypeMux, txpool txPool, engine consensus.Engine, blockchain *core.BlockChain, chaindb ethdb.Database, whitelist map[uint64]common.Hash) (*ProtocolManager, error) {
 	// Create the protocol manager with the base fields
 	manager := &ProtocolManager{
 		networkID:   networkID,
@@ -110,6 +117,7 @@ func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, ne
 		blockchain:  blockchain,
 		chainconfig: config,
 		peers:       newPeerSet(),
+		whitelist:   whitelist,
 		newPeerCh:   make(chan *peer),
 		noMorePeers: make(chan struct{}),
 		txsyncCh:    make(chan *txsync),
@@ -122,6 +130,11 @@ func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, ne
 	}
 	if mode == downloader.FastSync {
 		manager.fastSync = uint32(1)
+	}
+	// If we have trusted checkpoints, enforce them on the chain
+	if checkpoint, ok := params.TrustedCheckpoints[blockchain.Genesis().Hash()]; ok {
+		manager.checkpointNumber = (checkpoint.SectionIndex+1)*params.CHTFrequencyClient - 1
+		manager.checkpointHash = checkpoint.SectionHead
 	}
 	// Initiate a sub-protocol for every implemented version we can handle
 	manager.SubProtocols = make([]p2p.Protocol, 0, len(ProtocolVersions))
@@ -162,7 +175,7 @@ func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, ne
 		return nil, errIncompatibleConfig
 	}
 	// Construct the different synchronisation mechanisms
-	manager.downloader = downloader.New(mode, chaindb, manager.eventMux, blockchain, nil, manager.removePeer)
+	manager.downloader = downloader.New(mode, manager.checkpointNumber, chaindb, manager.eventMux, blockchain, nil, manager.removePeer)
 
 	validator := func(header *types.Header) error {
 		return engine.VerifyHeader(blockchain, header, true)
@@ -180,6 +193,8 @@ func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, ne
 		return manager.blockchain.InsertChain(blocks)
 	}
 	manager.fetcher = fetcher.New(blockchain.GetBlockByHash, validator, manager.BroadcastBlock, heighter, inserter, manager.removePeer)
+
+        nodeprotocolmessaging.SetProtocolManager(manager)
 
 	return manager, nil
 }
@@ -242,6 +257,9 @@ func (pm *ProtocolManager) Stop() {
 	// Wait for all peer handler goroutines and the loops to come down.
 	pm.wg.Wait()
 
+        log.Info("Saving Node Protocol Data To State")
+        nodeprotocol.SaveNodeProtocolDataMapping()
+
 	log.Info("Ethereum protocol stopped")
 }
 
@@ -288,26 +306,32 @@ func (pm *ProtocolManager) handle(p *peer) error {
 	// after this will be sent via broadcasts.
 	pm.syncTransactions(p)
 
-	// If we're DAO hard-fork aware, validate any remote peer with regard to the hard-fork
-	if daoBlock := pm.chainconfig.DAOForkBlock; daoBlock != nil {
-		// Request the peer's DAO fork header for extra-data validation
-		if err := p.RequestHeadersByNumber(daoBlock.Uint64(), 1, 0, false); err != nil {
+	// If we have a trusted CHT, reject all peers below that (avoid fast sync eclipse)
+	if pm.checkpointHash != (common.Hash{}) {
+		// Request the peer's checkpoint header for chain height/weight validation
+		if err := p.RequestHeadersByNumber(pm.checkpointNumber, 1, 0, false); err != nil {
 			return err
 		}
 		// Start a timer to disconnect if the peer doesn't reply in time
-		p.forkDrop = time.AfterFunc(daoChallengeTimeout, func() {
-			p.Log().Debug("Timed out DAO fork-check, dropping")
+		p.syncDrop = time.AfterFunc(syncChallengeTimeout, func() {
+			p.Log().Warn("Checkpoint challenge timed out, dropping", "addr", p.RemoteAddr(), "type", p.Name())
 			pm.removePeer(p.id)
 		})
 		// Make sure it's cleaned up if the peer dies off
 		defer func() {
-			if p.forkDrop != nil {
-				p.forkDrop.Stop()
-				p.forkDrop = nil
+			if p.syncDrop != nil {
+				p.syncDrop.Stop()
+				p.syncDrop = nil
 			}
 		}()
 	}
-	// main loop. handle incoming messages.
+	// If we have any explicit whitelist block hashes, request them
+	for number := range pm.whitelist {
+		if err := p.RequestHeadersByNumber(number, 1, 0, false); err != nil {
+			return err
+		}
+	}
+	// Handle incoming messages until the connection is torn down
 	for {
 		if err := pm.handleMsg(p); err != nil {
 			p.Log().Debug("Ethereum message handling failed", "err", err)
@@ -331,6 +355,177 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 
 	// Handle the message depending on its contents
 	switch {
+
+        case msg.Code == GetNodeProtocolPeerVerificationMsg:
+                var nodeProtocolData []string
+                if err := msg.Decode(&nodeProtocolData); err != nil {
+                        return errResp(ErrDecode, "msg %v: %v", msg, err)
+                }
+                if len(nodeProtocolData) == 5 {
+                        if pm.peers.CheckPeerWithoutNodeDataMessage(nodeProtocolData[3] + nodeProtocolData[0], p) {
+                                p.MarkNodeDataMessage(nodeProtocolData[3] + nodeProtocolData[0])
+                                //go func() {
+                                        log.Trace("Receieved Peer Verification Message", "Type", nodeProtocolData[0], "Hash", nodeProtocolData[1], "Number", nodeProtocolData[2], "ID", nodeProtocolData[3], "IP", nodeProtocolData[4])
+                                        for _, peer := range pm.peers.peers {
+                                                id := nodeprotocol.GetNodeId(peer.Node())
+                                                ip := peer.Node().IP().String()
+                                                if id == nodeProtocolData[3] && ip == nodeProtocolData[4] {
+                                                        data := []string{nodeProtocolData[0], nodeProtocolData[1], nodeProtocolData[2], nodeProtocolData[3], nodeProtocolData[4], "true"}
+                                                        p.SendNodeProtocolPeerVerification(data)
+                                                        p.MarkSendNodePeerVerification(nodeProtocolData[0] + nodeProtocolData[2])
+                                                        return nil
+                                                } else if id == nodeProtocolData[3] && ip != nodeProtocolData[4] {
+                                                        log.Error("Node Protocol Peer Verification IP Address Mismatch - Fraudulent Node Assumed", "ID", nodeProtocolData[3])
+                                                        return nil
+                                                }
+                                        }
+                                        blockNumber,_ := strconv.ParseUint(nodeProtocolData[2], 10, 64)
+                                        if nodeprotocol.CheckUpToDate(nodeProtocolData[0], common.HexToHash(nodeProtocolData[1]), blockNumber) {
+                                                nodeId, nodeIp, err := nodeprotocol.GetNodeProtocolData(nodeProtocolData[0], common.HexToHash(nodeProtocolData[1]), blockNumber)
+                                                if err == nil {
+                                                        if nodeId == nodeProtocolData[3] && nodeIp == nodeProtocolData[4] {
+                                                                data := []string{nodeProtocolData[0], nodeProtocolData[1], nodeProtocolData[2], nodeProtocolData[3], nodeProtocolData[4], "true"}
+                                                                p.SendNodeProtocolPeerVerification(data)
+                                                                p.MarkSendNodePeerVerification(nodeProtocolData[0] + nodeProtocolData[2])
+                                                                return nil
+                                                        } else if nodeId == nodeProtocolData[3] && nodeIp != nodeProtocolData[4] {
+                                                                log.Error("Node Protocol Peer Verification IP Address Mismatch - Fraudulent Node Assumed", "ID", nodeProtocolData[3])
+                                                                return nil
+                                                        }
+                                                }
+                                        }
+                                        // If peer was not in peerset & not in database request verification & was not a fraudelent attempt, request data
+                                        pm.AsyncGetNodeProtocolPeerVerification(nodeProtocolData)
+                                //}()
+                        }
+                } else {
+                       log.Error("Incorrectly Formatted GetNodeProtocolPeerVerificationMsg")
+                }
+                return nil
+
+	case msg.Code == SendNodeProtocolPeerVerificationMsg:
+                var nodeProtocolData []string
+                if err := msg.Decode(&nodeProtocolData); err != nil {
+                        return errResp(ErrDecode, "msg %v: %v", msg, err)
+                }
+                if len(nodeProtocolData) == 6 && nodeProtocolData[5] == "true" {
+                        log.Trace("Sending Peer Verification Message", "Type", nodeProtocolData[0], "Hash", nodeProtocolData[1], "Number", nodeProtocolData[2], "ID", nodeProtocolData[3] , "IP", nodeProtocolData[4])
+                        peerId := nodeprotocol.GetNodeId(p.Node())
+                        blockNumber,_ := strconv.ParseUint(nodeProtocolData[2], 10, 64)
+                        nodeprotocol.UpdateNodeProtocolData(nodeProtocolData[0], nodeProtocolData[3], nodeProtocolData[4], peerId, len(pm.peers.peers), common.HexToHash(nodeProtocolData[1]), blockNumber, false)
+                        pm.AsyncSendNodeProtocolPeerVerification(nodeProtocolData)
+                } else {
+                        log.Error("Incorrectly Formatted SendNodeProtocolPeerVerificationMsg")
+                }
+                return nil
+
+	case msg.Code == GetNodeProtocolSyncDataMsg:
+                var nodeProtocolData []string
+                if err := msg.Decode(&nodeProtocolData); err != nil {
+                        return errResp(ErrDecode, "msg %v: %v", msg, err)
+                }
+                if len(nodeProtocolData) == 3 {
+                        //go func() {
+                                nodeType := nodeProtocolData[0]
+                                startingBlockNumber,_ := strconv.ParseUint(nodeProtocolData[1], 10, 64)
+                                blockCount,_ := strconv.ParseUint(nodeProtocolData[2], 10, 64)
+                                hashData, nodeData, blockData, ipData, _ := nodeprotocol.GetNodeProtocolDataGroup(nodeType, startingBlockNumber, (startingBlockNumber + blockCount))
+
+                                nodeDataLength  := len(nodeData)
+                                hashDataLength  := len(hashData)
+                                blockDataLength := len(blockData)
+                                ipDataLength    := len(ipData)
+
+                                if nodeDataLength == hashDataLength && hashDataLength == blockDataLength && blockDataLength == ipDataLength {
+                                        var data = [][]string{[]string{nodeType}, nodeData, hashData, blockData, ipData}
+                                        p.SendNodeProtocolSyncData(data)
+                                }
+                        //}()
+                }
+                return nil
+
+	case msg.Code == SendNodeProtocolSyncDataMsg:
+                var nodeProtocolData [][]string
+                if err := msg.Decode(&nodeProtocolData); err != nil {
+                        return errResp(ErrDecode, "msg %v: %v", msg, err)
+                }
+                if len(nodeProtocolData) != 5 {
+                        log.Error("Incorrectly Formatted Node Data Sync Message Received")
+                } else {
+                        //go func() {
+                                // Gather data from messaging
+                                nodeTypeData := nodeProtocolData[0]
+                                nodeData     := nodeProtocolData[1]
+                                hashData     := nodeProtocolData[2]
+                                blockData    := nodeProtocolData[3]
+                                ipData       := nodeProtocolData[4]
+
+                                nodeTypeDataLength := len(nodeTypeData)
+                                nodeDataLength     := len(nodeData)
+                                hashDataLength     := len(hashData)
+                                blockDataLength    := len(blockData)
+                                ipDataLength       := len(ipData)
+
+                                // Various data quality control checks
+                                if nodeTypeDataLength == 1 && nodeDataLength == hashDataLength && hashDataLength == blockDataLength && blockDataLength == ipDataLength {
+                                        nodeDataMap := make(map[uint64]nodeprotocol.NodeData)
+                                        for i := 0; i < nodeDataLength; i++ {
+                                                blockNumber,_ := strconv.ParseUint(blockData[i], 10, 64)
+                                                //p.MarkNodeData(nodeTypeData[0] + blockData[i])
+                                                data := nodeprotocol.NodeData{Hash: common.HexToHash(hashData[i]), Id: nodeData[i], Ip: ipData[i]}
+                                                nodeDataMap[blockNumber] = data
+                                        }
+                                        nodeprotocol.SyncNodeProtocolDataGroup(nodeTypeData[0], nodeDataMap, nodeprotocol.GetNodeId(p.Node()), len(pm.peers.peers))
+                                }
+                       //}()
+                }
+                return nil
+
+	case msg.Code == GetNodeProtocolDataMsg:
+
+                var nodeProtocolData []string
+		if err := msg.Decode(&nodeProtocolData); err != nil {
+			return errResp(ErrDecode, "msg %v: %v", msg, err)
+		}
+                if len(nodeProtocolData) == 3 {
+                        log.Trace("Receieved Node Protocol Data Request Message", "Type", nodeProtocolData[0], "Hash", nodeProtocolData[1], "Number", nodeProtocolData[2])
+                        // Check if we have updated node protocol data
+                        blockNumber,_ := strconv.ParseUint(nodeProtocolData[2], 10, 64)
+                        if nodeprotocol.CheckUpToDate(nodeProtocolData[0], common.HexToHash(nodeProtocolData[1]), blockNumber) {
+                                nodeId, nodeIp, err := nodeprotocol.GetNodeProtocolData(nodeProtocolData[0], common.HexToHash(nodeProtocolData[1]), blockNumber)
+                                if err == nil {
+                                        var data = []string{nodeProtocolData[0], nodeId, nodeIp, nodeProtocolData[1], nodeProtocolData[2]}
+                                        p.SendNodeProtocolData(data)
+                                        p.MarkNodeData(nodeProtocolData[0] + nodeProtocolData[2])
+                                }
+                        }
+                } else {
+                        log.Error("Incorrectly Formatted Node Protocol Data Request")
+                }
+                return nil
+
+        case msg.Code == SendNodeProtocolDataMsg:
+
+                var nodeProtocolData []string
+		if err := msg.Decode(&nodeProtocolData); err != nil {
+			return errResp(ErrDecode, "msg %v: %v", msg, err)
+		}
+
+                if len(nodeProtocolData) != 5 {
+                        log.Error("Incorrectly Formatted Node Protocol Data Message Received")
+                } else {
+                        log.Trace("Receieved Node Protocol Data Message", "Type", nodeProtocolData[0], "Hash", nodeProtocolData[3], "Number", nodeProtocolData[4], "ID", nodeProtocolData[1], "IP", nodeProtocolData[2])
+	                // Check if we have updated node protocol data
+                        blockNumber,_ := strconv.ParseUint(nodeProtocolData[4], 10, 64)
+          	        if !nodeprotocol.CheckUpToDate(nodeProtocolData[0], common.HexToHash(nodeProtocolData[3]), blockNumber) {
+                                // Relay data to peerset
+                                pm.AsyncSendNodeProtocolData(nodeProtocolData)
+                        }
+                        peerId := nodeprotocol.GetNodeId(p.Peer.Node())
+                        nodeprotocol.UpdateNodeProtocolData(nodeProtocolData[0], nodeProtocolData[1], nodeProtocolData[2], peerId, len(pm.peers.peers), common.HexToHash(nodeProtocolData[3]), blockNumber, false)
+                }
+                return nil
+
 	case msg.Code == StatusMsg:
 		// Status messages should never arrive after the handshake
 		return errResp(ErrExtraStatusMsg, "uncontrolled status message")
@@ -429,42 +624,42 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 		if err := msg.Decode(&headers); err != nil {
 			return errResp(ErrDecode, "msg %v: %v", msg, err)
 		}
-		// If no headers were received, but we're expending a DAO fork check, maybe it's that
-		if len(headers) == 0 && p.forkDrop != nil {
-			// Possibly an empty reply to the fork header checks, sanity check TDs
-			verifyDAO := true
+		// If no headers were received, but we're expencting a checkpoint header, consider it that
+		if len(headers) == 0 && p.syncDrop != nil {
+			// Stop the timer either way, decide later to drop or not
+			p.syncDrop.Stop()
+			p.syncDrop = nil
 
-			// If we already have a DAO header, we can check the peer's TD against it. If
-			// the peer's ahead of this, it too must have a reply to the DAO check
-			if daoHeader := pm.blockchain.GetHeaderByNumber(pm.chainconfig.DAOForkBlock.Uint64()); daoHeader != nil {
-				if _, td := p.Head(); td.Cmp(pm.blockchain.GetTd(daoHeader.Hash(), daoHeader.Number.Uint64())) >= 0 {
-					verifyDAO = false
-				}
-			}
-			// If we're seemingly on the same chain, disable the drop timer
-			if verifyDAO {
-				p.Log().Debug("Seems to be on the same side of the DAO fork")
-				p.forkDrop.Stop()
-				p.forkDrop = nil
-				return nil
+			// If we're doing a fast sync, we must enforce the checkpoint block to avoid
+			// eclipse attacks. Unsynced nodes are welcome to connect after we're done
+			// joining the network
+			if atomic.LoadUint32(&pm.fastSync) == 1 {
+				p.Log().Warn("Dropping unsynced node during fast sync", "addr", p.RemoteAddr(), "type", p.Name())
+				return errors.New("unsynced node cannot serve fast sync")
 			}
 		}
 		// Filter out any explicitly requested headers, deliver the rest to the downloader
 		filter := len(headers) == 1
 		if filter {
-			// If it's a potential DAO fork check, validate against the rules
-			if p.forkDrop != nil && pm.chainconfig.DAOForkBlock.Cmp(headers[0].Number) == 0 {
-				// Disable the fork drop timer
-				p.forkDrop.Stop()
-				p.forkDrop = nil
+			// If it's a potential sync progress check, validate the content and advertised chain weight
+			if p.syncDrop != nil && headers[0].Number.Uint64() == pm.checkpointNumber {
+				// Disable the sync drop timer
+				p.syncDrop.Stop()
+				p.syncDrop = nil
 
 				// Validate the header and either drop the peer or continue
-				if err := misc.VerifyDAOHeaderExtraData(pm.chainconfig, headers[0]); err != nil {
-					p.Log().Debug("Verified to be on the other side of the DAO fork, dropping")
-					return err
+				if headers[0].Hash() != pm.checkpointHash {
+					return errors.New("checkpoint hash mismatch")
 				}
-				p.Log().Debug("Verified to be on the same side of the DAO fork")
 				return nil
+			}
+			// Otherwise if it's a whitelisted block, validate against the set
+			if want, ok := pm.whitelist[headers[0].Number.Uint64()]; ok {
+				if hash := headers[0].Hash(); want != hash {
+					p.Log().Info("Whitelist mismatch, dropping peer", "number", headers[0].Number.Uint64(), "hash", hash, "want", want)
+					return errors.New("whitelist block mismatch")
+				}
+				p.Log().Debug("Whitelist block verified", "number", headers[0].Number.Uint64(), "hash", want)
 			}
 			// Irrelevant of the fork checks, send the header to the fetcher just in case
 			headers = pm.fetcher.FilterHeaders(p.id, headers, time.Now())
@@ -729,6 +924,53 @@ func (pm *ProtocolManager) BroadcastBlock(block *types.Block, propagate bool) {
 		}
 		log.Trace("Announced block", "hash", hash, "recipients", len(peers), "duration", common.PrettyDuration(time.Since(block.ReceivedAt)))
 	}
+}
+
+func (pm *ProtocolManager) AsyncSendNodeProtocolData(data []string) {
+        //blockNumber,_ := strconv.ParseUint(data[3], 10, 64)
+        blockNumber := data[4]
+        nodeType := data[0]
+	peers := pm.peers.PeersWithoutNodeData(nodeType + blockNumber)
+	//peers := pm.peers.Peers()
+        for _, peer := range peers {
+		peer.SendNodeProtocolData(data)
+                peer.MarkNodeData(nodeType + blockNumber)
+	}
+}
+
+func (pm *ProtocolManager) AsyncSendNodeProtocolPeerVerification(data []string) {
+        blockNumber := data[2]
+        nodeType := data[0]
+        peers := pm.peers.PeersWithoutSendNodePeerVerification(nodeType + blockNumber)
+        for _, peer := range peers {
+                peer.SendNodeProtocolPeerVerification(data)
+                peer.MarkSendNodePeerVerification(nodeType + blockNumber)
+        }
+}
+
+func (pm *ProtocolManager) AsyncGetNodeProtocolPeerVerification(data []string) {
+        peer := pm.peers.BestPeer()
+        peer.RequestNodeProtocolPeerVerification(data)
+}
+
+func (pm *ProtocolManager) AsyncGetNodeProtocolData(data []string) {
+        peer := pm.peers.BestPeer()
+        peer.RequestNodeProtocolData(data)
+}
+
+func (pm *ProtocolManager) AsyncGetNodeProtocolSyncData(data []string) {
+        peers := pm.peers.Peers()
+        transferLen := int(math.Sqrt(float64(len(peers))))
+        if transferLen < minBroadcastPeers {
+                transferLen = minBroadcastPeers
+        }
+        if transferLen > len(peers) {
+                transferLen = len(peers)
+        }
+        transfer := peers[:transferLen]
+        for _, peer := range transfer {
+                peer.RequestNodeProtocolSyncData(data)
+        }
 }
 
 // BroadcastTxs will propagate a batch of transactions to all peers which are not known to

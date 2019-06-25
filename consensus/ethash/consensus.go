@@ -29,24 +29,26 @@ import (
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc"
+	"github.com/ethereum/go-ethereum/core/nodeprotocol"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto/sha3"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+	"golang.org/x/crypto/sha3"
 )
 
 // Ethash proof-of-work protocol constants.
 var (
-	FrontierBlockReward    *big.Int = new(big.Int).Mul(big.NewInt(10), big.NewInt(1e+18)) // Block reward in wei for successfully mining a block
-	ByzantiumBlockReward   *big.Int = new(big.Int).Mul(big.NewInt(10), big.NewInt(1e+18)) // Block reward in wei for successfully mining a block upward from Byzantium
-        //Constantinople Disabled For Ether-1 Implementation
-	ConstantinopleBlockReward      *big.Int = new(big.Int).Mul(big.NewInt(10), big.NewInt(1e+18)) // Block reward in wei for successfully mining a block upward from Constantinople
-	minerBlockReward               *big.Int = new(big.Int).Mul(big.NewInt(10), big.NewInt(1e+18))
-	masternodeBlockReward          *big.Int = big.NewInt(2e+18) 
-	developmentBlockReward         *big.Int = big.NewInt(1e+18) 
-	maxUncles                               = 2                 // Maximum number of uncles allowed in a single block
-	allowedFutureBlockTime                  = 15 * time.Second  // Max time from current time allowed for blocks, before they're considered future blocks
+	FrontierBlockReward  *big.Int = new(big.Int).Mul(big.NewInt(20), big.NewInt(1e+18)) // Block reward in wei for successfully mining a block
+	ByzantiumBlockReward *big.Int = new(big.Int).Mul(big.NewInt(20), big.NewInt(1e+18)) // Block reward in wei for successfully mining a block upward from Byzantium
+	//Constantinople Disabled For Ether-1 Implementation
+	ConstantinopleBlockReward *big.Int = new(big.Int).Mul(big.NewInt(20), big.NewInt(1e+18)) // Block reward in wei for successfully mining a block upward from Constantinople
+	minerBlockReward          *big.Int = new(big.Int).Mul(big.NewInt(20), big.NewInt(1e+18))
+	masternodeBlockReward     *big.Int = new(big.Int).Mul(big.NewInt(4), big.NewInt(1e+18))
+	developmentBlockReward    *big.Int = new(big.Int).Mul(big.NewInt(2), big.NewInt(1e+18))
+	maxUncles                          = 2                // Maximum number of uncles allowed in a single block
+	allowedFutureBlockTime             = 15 * time.Second // Max time from current time allowed for blocks, before they're considered future blocks
 
 	// calcDifficultyConstantinople is the difficulty adjustment algorithm for Constantinople.
 	// It returns the difficulty that a new block should have when created at time given the
@@ -67,7 +69,6 @@ var (
 // codebase, inherently breaking if the engine is swapped out. Please put common
 // error types into the consensus package.
 var (
-	errLargeBlockTime    = errors.New("timestamp too big")
 	errZeroBlockTime     = errors.New("timestamp equals parent's")
 	errTooManyUncles     = errors.New("too many uncles")
 	errDuplicateUncle    = errors.New("duplicate uncle")
@@ -246,20 +247,16 @@ func (ethash *Ethash) verifyHeader(chain consensus.ChainReader, header, parent *
 		return fmt.Errorf("extra-data too long: %d > %d", len(header.Extra), params.MaximumExtraDataSize)
 	}
 	// Verify the header's timestamp
-	if uncle {
-		if header.Time.Cmp(math.MaxBig256) > 0 {
-			return errLargeBlockTime
-		}
-	} else {
-		if header.Time.Cmp(big.NewInt(time.Now().Add(allowedFutureBlockTime).Unix())) > 0 {
+	if !uncle {
+		if header.Time > uint64(time.Now().Add(allowedFutureBlockTime).Unix()) {
 			return consensus.ErrFutureBlock
 		}
 	}
-	if header.Time.Cmp(parent.Time) <= 0 {
+	if header.Time <= parent.Time {
 		return errZeroBlockTime
 	}
 	// Verify the block's difficulty based in it's timestamp and parent's difficulty
-	expected := ethash.CalcDifficulty(chain, header.Time.Uint64(), parent)
+	expected := ethash.CalcDifficulty(chain, header.Time, parent)
 
 	if expected.Cmp(header.Difficulty) != 0 {
 		return fmt.Errorf("invalid difficulty: have %v, want %v", header.Difficulty, expected)
@@ -353,7 +350,7 @@ func makeDifficultyCalculator(bombDelay *big.Int) func(time uint64, parent *type
 		//        ) + 2^(periodCount - 2)
 
 		bigTime := new(big.Int).SetUint64(time)
-		bigParentTime := new(big.Int).Set(parent.Time)
+		bigParentTime := new(big.Int).SetUint64(parent.Time)
 
 		// holds intermediate values to make the algo easier to read & audit
 		x := new(big.Int)
@@ -412,7 +409,7 @@ func calcDifficultyHomestead(time uint64, parent *types.Header) *big.Int {
 	//        ) + 2^(periodCount - 2)
 
 	bigTime := new(big.Int).SetUint64(time)
-	bigParentTime := new(big.Int).Set(parent.Time)
+	bigParentTime := new(big.Int).SetUint64(parent.Time)
 
 	// holds intermediate values to make the algo easier to read & audit
 	x := new(big.Int)
@@ -460,7 +457,7 @@ func calcDifficultyFrontier(time uint64, parent *types.Header) *big.Int {
 	bigParentTime := new(big.Int)
 
 	bigTime.SetUint64(time)
-	bigParentTime.Set(parent.Time)
+	bigParentTime.SetUint64(parent.Time)
 
 	if bigTime.Sub(bigTime, bigParentTime).Cmp(params.DurationLimit) < 0 {
 		diff.Add(parent.Difficulty, adjust)
@@ -562,15 +559,67 @@ func (ethash *Ethash) Prepare(chain consensus.ChainReader, header *types.Header)
 	if parent == nil {
 		return consensus.ErrUnknownAncestor
 	}
-	header.Difficulty = ethash.CalcDifficulty(chain, header.Time.Uint64(), parent)
+	header.Difficulty = ethash.CalcDifficulty(chain, header.Time, parent)
 	return nil
 }
 
 // Finalize implements consensus.Engine, accumulating the block and uncle rewards,
 // setting the final state and assembling the block.
 func (ethash *Ethash) Finalize(chain consensus.ChainReader, header *types.Header, state *state.StateDB, txs []*types.Transaction, uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
+	var nodeAddresses []common.Address
+	var nodeRemainders []*big.Int
+
+	// If node-protocol is active, validate node payment address
+	if header.Number.Int64() > params.NodeProtocolBlock && header.Number.Int64() > 105 {
+
+		//Checking for active node
+		nodeprotocol.CheckActiveNode()
+
+		rewardHeader := chain.GetHeaderByNumber(header.Number.Uint64() - 100)
+		payoutHeader := chain.GetHeaderByNumber(header.Number.Uint64() - 105)
+
+		for _, nodeType := range params.NodeTypes {
+
+			var currentNodeId string
+			var currentNodeIp string
+			var currentNodeAddress common.Address
+
+			// Get total current node count from contract and save to caching addresses
+			currentNodeCount := nodeprotocol.GetNodeCount(state, nodeType.ContractAddress)
+			if currentNodeCount > 0 {
+				// Determine next reward candidate and save data to caching addresses
+				currentNodeId, currentNodeIp, currentNodeAddress = nodeprotocol.GetNodeCandidate(state, rewardHeader.Hash(), currentNodeCount, nodeType.ContractAddress)
+			} else {
+				currentNodeId = "None"
+				currentNodeIp = "None"
+				currentNodeAddress = common.HexToAddress("0x0")
+			}
+
+			nodeCount := nodeprotocol.UpdateNodeCount(state, currentNodeCount, nodeType.CountCachingAddresses)
+			nodeId, nodeIp, nodeAddress := nodeprotocol.UpdateNodeCandidate(state, currentNodeId, currentNodeIp, currentNodeAddress, nodeType.NodeIdCachingAddresses, nodeType.NodeIpCachingAddresses, nodeType.NodeAddressCachingAddresses)
+
+			if nodeCount > 0 {
+
+				if nodeprotocol.CheckNodeStatus(nodeType.Name, nodeId, nodeIp, payoutHeader.Hash(), payoutHeader.Number.Uint64()) {
+					log.Info("Node Status Verified", "Node Type", nodeType.Name)
+					nodeAddresses = append(nodeAddresses, nodeAddress)
+				} else {
+					log.Warn("Node Status Not Verified - Deferring To Remainder Address", "Node Type", nodeType.Name)
+					nodeAddresses = append(nodeAddresses, nodeType.RemainderAddress)
+				}
+			} else {
+				// Send reward to remainder address if zero nodes exist
+				log.Warn("No Active Nodes Found - Deferring to Remainder Address", "Node Type", nodeType.Name)
+				nodeAddresses = append(nodeAddresses, nodeType.RemainderAddress)
+			}
+
+			// Save node remainders
+			nodeRemainder := nodeprotocol.GetNodeRemainder(state, uint64(nodeCount), nodeType.RemainderAddress)
+			nodeRemainders = append(nodeRemainders, nodeRemainder)
+		}
+	}
 	// Accumulate any block and uncle rewards and commit the final state root
-	accumulateRewards(chain.Config(), state, header, uncles)
+	accumulateRewards(chain.Config(), state, header, uncles, nodeAddresses, nodeRemainders)
 	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
 
 	// Header seems complete, assemble into a block and return
@@ -579,7 +628,7 @@ func (ethash *Ethash) Finalize(chain consensus.ChainReader, header *types.Header
 
 // SealHash returns the hash of a block prior to it being sealed.
 func (ethash *Ethash) SealHash(header *types.Header) (hash common.Hash) {
-	hasher := sha3.NewKeccak256()
+	hasher := sha3.NewLegacyKeccak256()
 
 	rlp.Encode(hasher, []interface{}{
 		header.ParentHash,
@@ -609,91 +658,51 @@ var (
 // AccumulateRewards credits the coinbase of the given block with the mining
 // reward. The total reward consists of the static block reward and rewards for
 // included uncles. The coinbase of each uncle block is also rewarded.
-func accumulateRewards(config *params.ChainConfig, state *state.StateDB, header *types.Header, uncles []*types.Header) {
-	var blockReward = minerBlockReward // Set miner reward base
-	var masternodeReward = masternodeBlockReward // Set masternode reward
+func accumulateRewards(config *params.ChainConfig, state *state.StateDB, header *types.Header, uncles []*types.Header, nodeAddresses []common.Address, nodeRemainders []*big.Int) {
+	var blockReward = minerBlockReward             // Set miner reward base
+	var masternodeReward = masternodeBlockReward   // Set masternode reward
 	var developmentReward = developmentBlockReward // Set development reward
-	
+
 	if (header.Number.Int64() >= 1000000) && (header.Number.Int64() < 2000000) {
-	        blockReward = big.NewInt(8e+18)
-                masternodeReward = big.NewInt(2e+18)
-                developmentReward = big.NewInt(1e+18)
+		blockReward = new(big.Int).Mul(big.NewInt(18), big.NewInt(1e+18))
+		masternodeReward = new(big.Int).Mul(big.NewInt(4), big.NewInt(1e+18))
+		developmentReward = new(big.Int).Mul(big.NewInt(2), big.NewInt(1e+18))
 	} else if (header.Number.Int64() >= 2000000) && (header.Number.Int64() < 3000000) {
-	        blockReward = big.NewInt(640e+16)
-                masternodeReward = big.NewInt(2e+18)
-                developmentReward = big.NewInt(1e+18) 
+		blockReward = new(big.Int).Mul(big.NewInt(16), big.NewInt(1e+18))
+		masternodeReward = new(big.Int).Mul(big.NewInt(6), big.NewInt(1e+18))
+		developmentReward = new(big.Int).Mul(big.NewInt(2), big.NewInt(1e+18))
 	} else if (header.Number.Int64() >= 3000000) && (header.Number.Int64() < 4000000) {
-	        blockReward = big.NewInt(510e+16)
-                masternodeReward = big.NewInt(2e+18)
-                developmentReward = big.NewInt(1e+18) 
+		blockReward = new(big.Int).Mul(big.NewInt(14), big.NewInt(1e+18))
+		masternodeReward = new(big.Int).Mul(big.NewInt(6), big.NewInt(1e+18))
+		developmentReward = new(big.Int).Mul(big.NewInt(2), big.NewInt(1e+18))
 	} else if (header.Number.Int64() >= 4000000) && (header.Number.Int64() < 5000000) {
-	        blockReward = big.NewInt(400e+16)
-                masternodeReward = big.NewInt(2e+18)
-                developmentReward = big.NewInt(1e+18) 
+		blockReward = new(big.Int).Mul(big.NewInt(12), big.NewInt(1e+18))
+		masternodeReward = new(big.Int).Mul(big.NewInt(8), big.NewInt(1e+18))
+		developmentReward = new(big.Int).Mul(big.NewInt(2), big.NewInt(1e+18))
 	} else if (header.Number.Int64() >= 5000000) && (header.Number.Int64() < 6000000) {
-	        blockReward = big.NewInt(320e+16)
-                masternodeReward = big.NewInt(2e+18)
-                developmentReward = big.NewInt(1e+18)
-	} else if (header.Number.Int64() >= 6000000) && (header.Number.Int64()) < 7000000 {
-	        blockReward = big.NewInt(250e+16)
-                masternodeReward = big.NewInt(160e+16)
-                developmentReward = big.NewInt(80e+16)
+		blockReward = new(big.Int).Mul(big.NewInt(10), big.NewInt(1e+18))
+		masternodeReward = new(big.Int).Mul(big.NewInt(10), big.NewInt(1e+18))
+		developmentReward = new(big.Int).Mul(big.NewInt(2), big.NewInt(1e+18))
+	} else if (header.Number.Int64() >= 6000000) && (header.Number.Int64() < 7000000) {
+		blockReward = new(big.Int).Mul(big.NewInt(8), big.NewInt(1e+18))
+		masternodeReward = new(big.Int).Mul(big.NewInt(10), big.NewInt(1e+18))
+		developmentReward = new(big.Int).Mul(big.NewInt(2), big.NewInt(1e+18))
 	} else if (header.Number.Int64() >= 7000000) && (header.Number.Int64() < 8000000) {
-	        blockReward = big.NewInt(200e+16)
-                masternodeReward = big.NewInt(130e+16)
-                developmentReward = big.NewInt(65e+16)
+		blockReward = new(big.Int).Mul(big.NewInt(6), big.NewInt(1e+18))
+		masternodeReward = new(big.Int).Mul(big.NewInt(12), big.NewInt(1e+18))
+		developmentReward = new(big.Int).Mul(big.NewInt(1.5), big.NewInt(1e+18))
 	} else if (header.Number.Int64() >= 8000000) && (header.Number.Int64() < 9000000) {
-	        blockReward = big.NewInt(160e+16)
-                masternodeReward = big.NewInt(104e+16)
-                developmentReward = big.NewInt(52e+16)
+		blockReward = new(big.Int).Mul(big.NewInt(4), big.NewInt(1e+18))
+		masternodeReward = new(big.Int).Mul(big.NewInt(12), big.NewInt(1e+18))
+		developmentReward = new(big.Int).Mul(big.NewInt(1.5), big.NewInt(1e+17))
 	} else if (header.Number.Int64() >= 9000000) && (header.Number.Int64() < 10000000) {
-	        blockReward = big.NewInt(130e+16)
-                masternodeReward = big.NewInt(83e+16)
-                developmentReward = big.NewInt(415e+15)
-	} else if (header.Number.Int64() >= 10000000) && (header.Number.Int64() < 11000000) {
-	        blockReward = big.NewInt(100e+16)
-                masternodeReward = big.NewInt(66e+16)
-                developmentReward = big.NewInt(330e+15)
-	} else if (header.Number.Int64() >= 11000000) && (header.Number.Int64() < 12000000) {
-	        blockReward = big.NewInt(80e+16)
-                masternodeReward = big.NewInt(53e+16)
-                developmentReward = big.NewInt(265e+15)
-	} else if (header.Number.Int64() >= 12000000) && (header.Number.Int64() < 13000000) {
-	        blockReward = big.NewInt(65e+16)
-                masternodeReward = big.NewInt(42e+16)
-                developmentReward = big.NewInt(210e+15)
-	} else if (header.Number.Int64() >= 13000000) && (header.Number.Int64() < 14000000) {
-	        blockReward = big.NewInt(52e+16)
-                masternodeReward = big.NewInt(34e+16)
-                developmentReward = big.NewInt(170e+15)
-	} else if (header.Number.Int64() >= 14000000) && (header.Number.Int64() < 15000000) {
-	        blockReward = big.NewInt(42e+16)
-                masternodeReward = big.NewInt(27e+16)
-                developmentReward = big.NewInt(135e+15)
-	} else if (header.Number.Int64() >= 15000000) && (header.Number.Int64() < 16000000) {
-	        blockReward = big.NewInt(34e+16)
-                masternodeReward = big.NewInt(22e+16)
-                developmentReward = big.NewInt(110e+15)
-	} else if (header.Number.Int64() >= 16000000) && (header.Number.Int64() < 17000000) {
-	        blockReward = big.NewInt(27e+16)
-                masternodeReward = big.NewInt(18e+16)
-                developmentReward = big.NewInt(90e+15)
-	} else if (header.Number.Int64() >= 17000000) && (header.Number.Int64() < 18000000) {
-	        blockReward = big.NewInt(22e+16)
-                masternodeReward = big.NewInt(14e+16)
-                developmentReward = big.NewInt(70e+15)
-	} else if (header.Number.Int64() >= 18000000) && (header.Number.Int64() < 19000000) {
-	        blockReward = big.NewInt(18e+16)
-                masternodeReward = big.NewInt(11e+16)
-                developmentReward = big.NewInt(55e+15)
-	} else if (header.Number.Int64() >= 19000000) && (header.Number.Int64() < 20000000) {
-	        blockReward = big.NewInt(15e+16)
-                masternodeReward = big.NewInt(9e+16)
-                developmentReward = big.NewInt(45e+15)
-	} else if (header.Number.Int64() >= 20000000) {
-	        blockReward = big.NewInt(12e+16)
-                masternodeReward = big.NewInt(7e+16)
-                developmentReward = big.NewInt(35e+15)
+		blockReward = new(big.Int).Mul(big.NewInt(4), big.NewInt(1e+18))
+		masternodeReward = new(big.Int).Mul(big.NewInt(12), big.NewInt(1e+18))
+		developmentReward = new(big.Int).Mul(big.NewInt(1.5), big.NewInt(1e+17))
+	} else if header.Number.Int64() >= 10000000 {
+		blockReward = new(big.Int).Mul(big.NewInt(2), big.NewInt(1e+18))
+		masternodeReward = new(big.Int).Mul(big.NewInt(14), big.NewInt(1e+18))
+		developmentReward = new(big.Int).Mul(big.NewInt(1.5), big.NewInt(1e+17))
 	}
 	if config.IsConstantinople(header.Number) {
 		blockReward = ConstantinopleBlockReward
@@ -713,7 +722,21 @@ func accumulateRewards(config *params.ChainConfig, state *state.StateDB, header 
 	}
 	state.AddBalance(header.Coinbase, reward)
 	// Developement Fund Address
-	state.AddBalance(common.HexToAddress("0xE2c8cbEc30c8513888F7A95171eA836f8802d981"), developmentReward)
-	// Masternode Fund address
-        state.AddBalance(common.HexToAddress("0xE19363Ffb51C62bEECd6783A2c9C5bfF5D4679ac"), masternodeReward)
+	state.AddBalance(common.HexToAddress("0xB69B9216B5089Dc3881A4E38f691e9B6943DFA11"), developmentReward)
+	// Node Rewards via consensus
+	if header.Number.Int64() > params.NodeProtocolBlock {
+		if len(nodeAddresses) == len(params.NodeTypes) {
+			// Iterate over node types to disburse node rewards and calculated remainders
+			for i := 0; i < len(params.NodeTypes); i++ {
+				nodeReward := new(big.Int).Div(new(big.Int).Mul(masternodeReward, params.NodeTypes[i].RewardSplit), big.NewInt(100))
+				// Validated Node Address
+				state.AddBalance(nodeAddresses[i], nodeReward)
+				// Node Fund Remainder
+				state.AddBalance(nodeAddresses[i], nodeRemainders[i])
+				state.SubBalance(params.NodeTypes[i].RemainderAddress, nodeRemainders[i])
+			}
+		} else {
+			log.Warn("Validated Node Data Receipt Error", "Error", "Validated Node Data Not Found")
+		}
+	}
 }
